@@ -24,6 +24,7 @@ type Sum struct {
 	inputQueue     middleware.Middleware
 	outputExchange middleware.Middleware
 	fruitItemMap   map[string]map[string]fruititem.FruitItem
+	sumAmount      int
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -49,6 +50,7 @@ func NewSum(config SumConfig) (*Sum, error) {
 		inputQueue:     inputQueue,
 		outputExchange: outputExchange,
 		fruitItemMap:   map[string]map[string]fruititem.FruitItem{},
+		sumAmount:      config.SumAmount,
 	}, nil
 }
 
@@ -61,13 +63,18 @@ func (sum *Sum) Run() {
 func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
-	queryID, fruitRecords, isEof, err := inner.DeserializeMessageWithID(&msg)
+	queryID, fruitRecords, isEof, propagated, err := inner.DeserializeMessageWithID(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		return
 	}
 
 	if isEof {
+
+		if !propagated {
+			sum.propagateEndOfRecordMessage(queryID)
+		}
+
 		if err := sum.handleEndOfRecordMessage(queryID); err != nil {
 			slog.Error("While handling end of record message", "err", err)
 		}
@@ -133,4 +140,17 @@ func (sum *Sum) handleDataMessage(queryID string, fruitRecords []fruititem.Fruit
 	}
 
 	return nil
+}
+
+func (sum *Sum) propagateEndOfRecordMessage(queryID string) {
+	for i := 0; i < sum.sumAmount*3; i++ {
+		eofMsg, err := inner.SerializeMessageWithIDAndPropagation(queryID, []fruititem.FruitItem{}, true)
+		if err != nil {
+			slog.Error("While serializing propagated EOF", "err", err)
+			continue
+		}
+		if err := sum.inputQueue.Send(*eofMsg); err != nil {
+			slog.Error("While sending propagated EOF", "err", err)
+		}
+	}
 }
