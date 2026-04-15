@@ -80,7 +80,7 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 			"expected", aggregation.sumAmount,
 		)
 
-		if aggregation.eofCount[queryID] == aggregation.sumAmount {
+		if aggregation.eofCount[queryID] >= aggregation.sumAmount {
 			if err := aggregation.handleEndOfRecordsMessage(queryID); err != nil {
 				slog.Error("While handling end of record message", "err", err)
 			}

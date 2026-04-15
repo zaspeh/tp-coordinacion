@@ -21,10 +21,12 @@ type SumConfig struct {
 }
 
 type Sum struct {
-	inputQueue     middleware.Middleware
-	outputExchange middleware.Middleware
-	fruitItemMap   map[string]map[string]fruititem.FruitItem
-	sumAmount      int
+	inputQueue        middleware.Middleware
+	outputExchanges   []middleware.Middleware
+	fruitItemMap      map[string]map[string]fruititem.FruitItem
+	sumAmount         int
+	aggregationAmount int
+	aggregationPrefix string
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -35,22 +37,34 @@ func NewSum(config SumConfig) (*Sum, error) {
 		return nil, err
 	}
 
-	outputExchangeRouteKeys := make([]string, config.AggregationAmount)
-	for i := range config.AggregationAmount {
-		outputExchangeRouteKeys[i] = fmt.Sprintf("%s_%d", config.AggregationPrefix, i)
-	}
+	outputExchanges := make([]middleware.Middleware, config.AggregationAmount)
 
-	outputExchange, err := middleware.CreateExchangeMiddleware(config.AggregationPrefix, outputExchangeRouteKeys, connSettings)
-	if err != nil {
-		inputQueue.Close()
-		return nil, err
+	for i := 0; i < config.AggregationAmount; i++ {
+		key := fmt.Sprintf("%s_%d", config.AggregationPrefix, i)
+
+		exchange, err := middleware.CreateExchangeMiddleware(
+			config.AggregationPrefix,
+			[]string{key},
+			connSettings,
+		)
+		if err != nil {
+			inputQueue.Close()
+			for j := 0; j < i; j++ {
+				outputExchanges[j].Close()
+			}
+			return nil, err
+		}
+
+		outputExchanges[i] = exchange
 	}
 
 	return &Sum{
-		inputQueue:     inputQueue,
-		outputExchange: outputExchange,
-		fruitItemMap:   map[string]map[string]fruititem.FruitItem{},
-		sumAmount:      config.SumAmount,
+		inputQueue:        inputQueue,
+		outputExchanges:   outputExchanges,
+		fruitItemMap:      map[string]map[string]fruititem.FruitItem{},
+		sumAmount:         config.SumAmount,
+		aggregationAmount: config.AggregationAmount,
+		aggregationPrefix: config.AggregationPrefix,
 	}, nil
 }
 
@@ -96,28 +110,32 @@ func (sum *Sum) handleEndOfRecordMessage(queryID string) error {
 	}
 
 	for _, fruitRecord := range fruitMap {
+		aggID := getAggregationID(fruitRecord.Fruit, sum.aggregationAmount)
+
 		message, err := inner.SerializeMessageWithID(queryID, []fruititem.FruitItem{fruitRecord})
 		if err != nil {
 			slog.Debug("While serializing message", "err", err)
 			return err
 		}
 
-		if err := sum.outputExchange.Send(*message); err != nil {
+		if err := sum.outputExchanges[aggID].Send(*message); err != nil {
 			slog.Debug("While sending message", "err", err)
 			return err
 		}
 	}
 
-	// envio EOF solo de esta query
-	message, err := inner.SerializeMessageWithID(queryID, []fruititem.FruitItem{})
-	if err != nil {
-		slog.Debug("While serializing EOF message", "err", err)
-		return err
-	}
+	// envio EOF de esta query a todos los aggregations
+	for i := 0; i < sum.aggregationAmount; i++ {
+		message, err := inner.SerializeMessageWithID(queryID, []fruititem.FruitItem{})
+		if err != nil {
+			slog.Debug("While serializing EOF message", "err", err)
+			return err
+		}
 
-	if err := sum.outputExchange.Send(*message); err != nil {
-		slog.Debug("While sending EOF message", "err", err)
-		return err
+		if err := sum.outputExchanges[i].Send(*message); err != nil {
+			slog.Debug("While sending EOF message", "err", err)
+			return err
+		}
 	}
 
 	delete(sum.fruitItemMap, queryID)
@@ -153,4 +171,12 @@ func (sum *Sum) propagateEndOfRecordMessage(queryID string) {
 			slog.Error("While sending propagated EOF", "err", err)
 		}
 	}
+}
+
+func getAggregationID(fruit string, aggregationAmount int) int {
+	hash := 0
+	for _, c := range fruit {
+		hash += int(c)
+	}
+	return hash % aggregationAmount
 }
