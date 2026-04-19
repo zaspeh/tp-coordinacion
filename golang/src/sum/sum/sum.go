@@ -3,6 +3,7 @@ package sum
 import (
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -23,7 +24,9 @@ type SumConfig struct {
 type Sum struct {
 	inputQueue        middleware.Middleware
 	outputExchanges   []middleware.Middleware
+	controlExchange   middleware.Middleware
 	fruitItemMap      map[string]map[string]fruititem.FruitItem
+	fruitMapLock      sync.Mutex
 	sumAmount         int
 	aggregationAmount int
 	aggregationPrefix string
@@ -58,10 +61,30 @@ func NewSum(config SumConfig) (*Sum, error) {
 		outputExchanges[i] = exchange
 	}
 
+	controlKeys := make([]string, config.SumAmount)
+	for i := 0; i < config.SumAmount; i++ {
+		controlKeys[i] = fmt.Sprintf("%s_%d", config.SumPrefix, i)
+	}
+
+	controlExchange, err := middleware.CreateExchangeMiddleware(
+		config.SumPrefix,
+		controlKeys,
+		connSettings,
+	)
+	if err != nil {
+		inputQueue.Close()
+		for _, ex := range outputExchanges {
+			ex.Close()
+		}
+		return nil, err
+	}
+
 	return &Sum{
 		inputQueue:        inputQueue,
 		outputExchanges:   outputExchanges,
+		controlExchange:   controlExchange,
 		fruitItemMap:      map[string]map[string]fruititem.FruitItem{},
+		fruitMapLock:      sync.Mutex{},
 		sumAmount:         config.SumAmount,
 		aggregationAmount: config.AggregationAmount,
 		aggregationPrefix: config.AggregationPrefix,
@@ -69,6 +92,10 @@ func NewSum(config SumConfig) (*Sum, error) {
 }
 
 func (sum *Sum) Run() {
+	go sum.controlExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+		sum.handleMessage(msg, ack, nack)
+	})
+
 	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		sum.handleMessage(msg, ack, nack)
 	})
@@ -104,46 +131,50 @@ func (sum *Sum) handleEndOfRecordMessage(queryID string) error {
 	slog.Info("Received End Of Records message")
 
 	// me interesan las frutas de esta query
+	sum.fruitMapLock.Lock()
+
 	fruitMap, ok := sum.fruitItemMap[queryID]
 	if !ok {
+		sum.fruitMapLock.Unlock()
 		return nil
 	}
 
-	for _, fruitRecord := range fruitMap {
+	// copio los datos
+	localCopy := make([]fruititem.FruitItem, 0, len(fruitMap))
+	for _, v := range fruitMap {
+		localCopy = append(localCopy, v)
+	}
+
+	delete(sum.fruitItemMap, queryID)
+
+	sum.fruitMapLock.Unlock()
+
+	for _, fruitRecord := range localCopy {
 		aggID := getAggregationID(fruitRecord.Fruit, sum.aggregationAmount)
 
 		message, err := inner.SerializeMessageWithID(queryID, []fruititem.FruitItem{fruitRecord})
 		if err != nil {
-			slog.Debug("While serializing message", "err", err)
 			return err
 		}
 
 		if err := sum.outputExchanges[aggID].Send(*message); err != nil {
-			slog.Debug("While sending message", "err", err)
 			return err
 		}
 	}
 
-	// envio EOF de esta query a todos los aggregations
+	// EOF
 	for i := 0; i < sum.aggregationAmount; i++ {
-		message, err := inner.SerializeMessageWithID(queryID, []fruititem.FruitItem{})
-		if err != nil {
-			slog.Debug("While serializing EOF message", "err", err)
-			return err
-		}
-
-		if err := sum.outputExchanges[i].Send(*message); err != nil {
-			slog.Debug("While sending EOF message", "err", err)
-			return err
-		}
+		message, _ := inner.SerializeMessageWithID(queryID, []fruititem.FruitItem{})
+		sum.outputExchanges[i].Send(*message)
 	}
-
-	delete(sum.fruitItemMap, queryID)
 
 	return nil
 }
 
 func (sum *Sum) handleDataMessage(queryID string, fruitRecords []fruititem.FruitItem) error {
+	sum.fruitMapLock.Lock()
+	defer sum.fruitMapLock.Unlock()
+
 	if _, ok := sum.fruitItemMap[queryID]; !ok {
 		sum.fruitItemMap[queryID] = map[string]fruititem.FruitItem{}
 	}
@@ -161,15 +192,14 @@ func (sum *Sum) handleDataMessage(queryID string, fruitRecords []fruititem.Fruit
 }
 
 func (sum *Sum) propagateEndOfRecordMessage(queryID string) {
-	for i := 0; i < sum.sumAmount*3; i++ {
-		eofMsg, err := inner.SerializeMessageWithIDAndPropagation(queryID, []fruititem.FruitItem{}, true)
-		if err != nil {
-			slog.Error("While serializing propagated EOF", "err", err)
-			continue
-		}
-		if err := sum.inputQueue.Send(*eofMsg); err != nil {
-			slog.Error("While sending propagated EOF", "err", err)
-		}
+	eofMsg, err := inner.SerializeMessageWithIDAndPropagation(queryID, []fruititem.FruitItem{}, true)
+	if err != nil {
+		slog.Error("While serializing propagated EOF", "err", err)
+		return
+	}
+
+	if err := sum.controlExchange.Send(*eofMsg); err != nil {
+		slog.Error("While sending propagated EOF", "err", err)
 	}
 }
 
