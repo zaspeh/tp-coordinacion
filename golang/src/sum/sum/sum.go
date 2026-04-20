@@ -66,6 +66,9 @@ func NewSum(config SumConfig) (*Sum, error) {
 
 	controlKeys := make([]string, 0, config.SumAmount-1)
 	for i := 0; i < config.SumAmount; i++ {
+		if i == config.Id {
+			continue
+		}
 		controlKeys = append(controlKeys, fmt.Sprintf("%s_%d", config.SumPrefix, i))
 	}
 
@@ -139,7 +142,7 @@ func (sum *Sum) handleData(msg middleware.Message, ack func(), nack func()) {
 
 	if isEof {
 		// este EOF viene del gateway en el inputQueue
-		if !propagated {
+		if sum.sumAmount > 1 && !propagated {
 			if err := sum.propagateEndOfRecordMessage(queryID); err != nil {
 				slog.Error("While propagating EOF", "err", err)
 				nack()
