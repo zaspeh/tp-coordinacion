@@ -66,9 +66,6 @@ func NewSum(config SumConfig) (*Sum, error) {
 
 	controlKeys := make([]string, 0, config.SumAmount-1)
 	for i := 0; i < config.SumAmount; i++ {
-		if i == config.Id {
-			continue
-		}
 		controlKeys = append(controlKeys, fmt.Sprintf("%s_%d", config.SumPrefix, i))
 	}
 
@@ -121,12 +118,14 @@ func (sum *Sum) Run() {
 	sig := <-sigChan
 	slog.Info("Received signal, shutting down", "signal", sig)
 
-	//sum.flushAll() -> preguntar al profe como debería actuar en el sigterm
+	//sum.flushAll() -> preguntar al profe si debería enviar los datos que tengo
 
 	sum.inputQueue.Close()
 	sum.controlExchange.Close()
-	for _, ex := range sum.outputExchanges {
-		ex.Close()
+	for i, ex := range sum.outputExchanges {
+		if err := ex.Close(); err != nil {
+			slog.Error("error closing aggregation exchange", "index", i, "err", err)
+		}
 	}
 }
 
