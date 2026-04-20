@@ -64,9 +64,12 @@ func NewSum(config SumConfig) (*Sum, error) {
 		outputExchanges[i] = exchange
 	}
 
-	controlKeys := make([]string, config.SumAmount)
+	controlKeys := make([]string, 0, config.SumAmount-1)
 	for i := 0; i < config.SumAmount; i++ {
-		controlKeys[i] = fmt.Sprintf("%s_%d", config.SumPrefix, i)
+		if i == config.Id {
+			continue
+		}
+		controlKeys = append(controlKeys, fmt.Sprintf("%s_%d", config.SumPrefix, i))
 	}
 
 	controlExchange, err := middleware.CreateExchangeMiddleware(
