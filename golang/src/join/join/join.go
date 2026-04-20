@@ -2,7 +2,10 @@ package join
 
 import (
 	"log/slog"
+	"os"
+	"os/signal"
 	"sort"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -57,9 +60,22 @@ func NewJoin(config JoinConfig) (*Join, error) {
 }
 
 func (join *Join) Run() {
-	join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		join.handleMessage(msg, ack, nack)
-	})
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM)
+
+	go func() {
+		if err := join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			join.handleMessage(msg, ack, nack)
+		}); err != nil {
+			slog.Error("join consumer failed", "err", err)
+		}
+	}()
+
+	sig := <-sigChan
+	slog.Info("Received signal, shutting down", "signal", sig)
+
+	join.inputQueue.Close()
+	join.outputQueue.Close()
 }
 
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {

@@ -3,7 +3,10 @@ package sum
 import (
 	"fmt"
 	"log/slog"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -92,13 +95,36 @@ func NewSum(config SumConfig) (*Sum, error) {
 }
 
 func (sum *Sum) Run() {
-	go sum.controlExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		sum.handleControl(msg, ack, nack)
-	})
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM)
 
-	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		sum.handleData(msg, ack, nack)
-	})
+	go func() {
+		if err := sum.controlExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			sum.handleControl(msg, ack, nack)
+		}); err != nil {
+			slog.Error("control consumer failed", "err", err)
+		}
+	}()
+
+	go func() {
+		if err := sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			sum.handleData(msg, ack, nack)
+		}); err != nil {
+			slog.Error("input consumer failed", "err", err)
+		}
+	}()
+
+	// me quedo esperando hasta sigterm
+	sig := <-sigChan
+	slog.Info("Received signal, shutting down", "signal", sig)
+
+	//sum.flushAll() -> preguntar al profe como debería actuar en el sigterm
+
+	sum.inputQueue.Close()
+	sum.controlExchange.Close()
+	for _, ex := range sum.outputExchanges {
+		ex.Close()
+	}
 }
 
 func (sum *Sum) handleData(msg middleware.Message, ack func(), nack func()) {
@@ -241,6 +267,23 @@ func (sum *Sum) propagateEndOfRecordMessage(queryID string) error {
 	}
 
 	return nil
+}
+
+func (sum *Sum) flushAll() {
+	sum.fruitMapLock.Lock()
+
+	queries := make([]string, 0, len(sum.fruitItemMap))
+	for q := range sum.fruitItemMap {
+		queries = append(queries, q)
+	}
+
+	sum.fruitMapLock.Unlock()
+
+	for _, q := range queries {
+		if err := sum.handleEndOfRecordMessage(q); err != nil {
+			slog.Error("Error flushing query", "queryID", q, "err", err)
+		}
+	}
 }
 
 func getAggregationID(fruit string, aggregationAmount int) int {
