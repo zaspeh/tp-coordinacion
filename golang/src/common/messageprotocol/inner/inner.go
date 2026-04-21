@@ -12,13 +12,27 @@ type envelope struct {
 	QueryID    string          `json:"query_id"`
 	Data       [][]interface{} `json:"data"`
 	Propagated bool            `json:"propagated,omitempty"`
+
+	TotalCount   *int `json:"total_count,omitempty"`   // viene del EOF del cliente
+	PartialCount *int `json:"partial_count,omitempty"` // viene de cada sum
+	SumID        *int `json:"sum_id,omitempty"`        // para seguimiento en aggregation
 }
 
 func SerializeMessageWithID(queryID string, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
-	return SerializeMessageWithIDAndPropagation(queryID, fruitRecords, false)
+	return SerializeMessageWithIDAndPropagationAndTotal(queryID, fruitRecords, false, nil)
 }
 
 func SerializeMessageWithIDAndPropagation(queryID string, fruitRecords []fruititem.FruitItem, propagated bool) (*middleware.Message, error) {
+	return SerializeMessageWithIDAndPropagationAndTotal(queryID, fruitRecords, propagated, nil)
+}
+
+func SerializeMessageWithIDAndPropagationAndTotal(
+	queryID string,
+	fruitRecords []fruititem.FruitItem,
+	propagated bool,
+	totalCount *int,
+) (*middleware.Message, error) {
+
 	data := [][]interface{}{}
 
 	for _, fruitRecord := range fruitRecords {
@@ -33,6 +47,7 @@ func SerializeMessageWithIDAndPropagation(queryID string, fruitRecords []fruitit
 		QueryID:    queryID,
 		Data:       data,
 		Propagated: propagated,
+		TotalCount: totalCount,
 	}
 
 	body, err := json.Marshal(env)
@@ -44,28 +59,44 @@ func SerializeMessageWithIDAndPropagation(queryID string, fruitRecords []fruitit
 	return &message, nil
 }
 
-func DeserializeMessageWithID(message *middleware.Message) (string, []fruititem.FruitItem, bool, bool, error) {
+func SerializePartialMessage(queryID string, partial int, sumID int) (*middleware.Message, error) {
+	env := envelope{
+		QueryID:      queryID,
+		Data:         [][]interface{}{},
+		PartialCount: &partial,
+		SumID:        &sumID,
+	}
+
+	body, err := json.Marshal(env)
+	if err != nil {
+		return nil, err
+	}
+
+	return &middleware.Message{Body: string(body)}, nil
+}
+
+func DeserializeMessageWithID(message *middleware.Message) (string, []fruititem.FruitItem, bool, bool, *int, error) {
 	var env envelope
 
 	if err := json.Unmarshal([]byte(message.Body), &env); err != nil {
-		return "", nil, false, false, err
+		return "", nil, false, false, nil, err
 	}
 
 	fruitRecords := []fruititem.FruitItem{}
 
 	for _, datum := range env.Data {
 		if len(datum) != 2 {
-			return "", nil, false, false, errors.New("Datum is not an array")
+			return "", nil, false, false, nil, errors.New("Datum is not an array")
 		}
 
 		fruit, ok := datum[0].(string)
 		if !ok {
-			return "", nil, false, false, errors.New("Datum is not a (fruit, amount) pair")
+			return "", nil, false, false, nil, errors.New("Datum is not a (fruit, amount) pair")
 		}
 
 		amount, ok := datum[1].(float64)
 		if !ok {
-			return "", nil, false, false, errors.New("Datum is not a (fruit, amount) pair")
+			return "", nil, false, false, nil, errors.New("Datum is not a (fruit, amount) pair")
 		}
 
 		fruitRecords = append(fruitRecords, fruititem.FruitItem{
@@ -76,5 +107,42 @@ func DeserializeMessageWithID(message *middleware.Message) (string, []fruititem.
 
 	isEOF := len(fruitRecords) == 0
 
-	return env.QueryID, fruitRecords, isEOF, env.Propagated, nil
+	return env.QueryID, fruitRecords, isEOF, env.Propagated, env.TotalCount, nil
+}
+
+func DeserializeFullMessage(message *middleware.Message) (
+	string,
+	[]fruititem.FruitItem,
+	bool,
+	bool,
+	*int,
+	*int,
+	*int,
+	error,
+) {
+	var env envelope
+
+	if err := json.Unmarshal([]byte(message.Body), &env); err != nil {
+		return "", nil, false, false, nil, nil, nil, err
+	}
+
+	fruitRecords := []fruititem.FruitItem{}
+
+	for _, datum := range env.Data {
+		if len(datum) != 2 {
+			return "", nil, false, false, nil, nil, nil, errors.New("invalid datum")
+		}
+
+		fruit := datum[0].(string)
+		amount := uint32(datum[1].(float64))
+
+		fruitRecords = append(fruitRecords, fruititem.FruitItem{
+			Fruit:  fruit,
+			Amount: amount,
+		})
+	}
+
+	isEOF := len(fruitRecords) == 0
+
+	return env.QueryID, fruitRecords, isEOF, env.Propagated, env.TotalCount, env.PartialCount, env.SumID, nil
 }

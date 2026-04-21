@@ -11,7 +11,8 @@ import (
 )
 
 type MessageHandler struct {
-	id string
+	id    string
+	count int
 }
 
 func NewMessageHandler() MessageHandler {
@@ -21,17 +22,27 @@ func NewMessageHandler() MessageHandler {
 }
 
 func (messageHandler *MessageHandler) SerializeDataMessage(fruitRecord fruititem.FruitItem) (*middleware.Message, error) {
+	messageHandler.count++
 	data := []fruititem.FruitItem{fruitRecord}
+
 	return inner.SerializeMessageWithID(messageHandler.id, data)
 }
 
 func (messageHandler *MessageHandler) SerializeEOFMessage() (*middleware.Message, error) {
 	data := []fruititem.FruitItem{}
-	return inner.SerializeMessageWithID(messageHandler.id, data)
+
+	total := messageHandler.count
+
+	return inner.SerializeMessageWithIDAndPropagationAndTotal(
+		messageHandler.id,
+		data,
+		false,
+		&total,
+	)
 }
 
 func (messageHandler *MessageHandler) DeserializeResultMessage(message *middleware.Message) ([]fruititem.FruitItem, error) {
-	queryID, fruitRecords, _, _, err := inner.DeserializeMessageWithID(message)
+	queryID, fruitRecords, _, _, _, err := inner.DeserializeMessageWithID(message)
 	if err != nil {
 		return nil, err
 	}

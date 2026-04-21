@@ -81,7 +81,7 @@ func (join *Join) Run() {
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
-	queryID, fruitRecords, isEof, _, err := inner.DeserializeMessageWithID(&msg)
+	queryID, fruitRecords, isEof, _, _, err := inner.DeserializeMessageWithID(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		return
@@ -92,7 +92,7 @@ func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func())
 		slog.Info("Join received EOF", "queryID", queryID)
 		join.eofCount[queryID]++
 
-		if join.eofCount[queryID] >= join.aggregationAmount {
+		if join.eofCount[queryID] == join.aggregationAmount {
 			join.sendFinalTop(queryID)
 			delete(join.eofCount, queryID)
 		}

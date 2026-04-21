@@ -31,7 +31,8 @@ type Aggregation struct {
 	fruitItemMap  map[string]map[string]fruititem.FruitItem
 	topSize       int
 	sumAmount     int
-	eofCount      map[string]int
+	totalCount    map[string]*int
+	partialCounts map[string]map[int]int
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -55,7 +56,8 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		fruitItemMap:  map[string]map[string]fruititem.FruitItem{},
 		topSize:       config.TopSize,
 		sumAmount:     config.SumAmount,
-		eofCount:      map[string]int{},
+		totalCount:    map[string]*int{},
+		partialCounts: map[string]map[int]int{},
 	}, nil
 }
 
@@ -79,34 +81,48 @@ func (aggregation *Aggregation) Run() {
 }
 
 func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {
-	defer ack()
-
-	queryID, fruitRecords, isEof, _, err := inner.DeserializeMessageWithID(&msg)
+	queryID, fruitRecords, isEof, _, totalCount, partialCount, sumID, err := inner.DeserializeFullMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
+		nack()
 		return
 	}
 
-	if isEof {
-		aggregation.eofCount[queryID]++
+	slog.Info("Received message",
+		"queryID", queryID,
+		"isEof", isEof,
+		"fruits", len(fruitRecords),
+		"totalCount", totalCount,
+		"partialCount", partialCount,
+		"sumID", sumID,
+	)
 
-		slog.Info("End of record message received",
-			"queryID", queryID,
-			"count", aggregation.eofCount[queryID],
-			"expected", aggregation.sumAmount,
-		)
-
-		if aggregation.eofCount[queryID] >= aggregation.sumAmount {
-			if err := aggregation.handleEndOfRecordsMessage(queryID); err != nil {
-				slog.Error("While handling end of record message", "err", err)
-			}
-			delete(aggregation.eofCount, queryID)
+	// partial_count
+	if partialCount != nil && sumID != nil {
+		if _, ok := aggregation.partialCounts[queryID]; !ok {
+			aggregation.partialCounts[queryID] = map[int]int{}
 		}
+		aggregation.partialCounts[queryID][*sumID] = *partialCount
+		slog.Info("Received partial count", "queryID", queryID, "sumID", *sumID, "partialCount", *partialCount)
+		aggregation.maybeFlush(queryID)
+		ack()
+		return
+	}
 
+	// EOF + total_cunt
+	if isEof {
+		if totalCount != nil {
+			aggregation.totalCount[queryID] = totalCount
+			slog.Info("Received EOF with total count", "queryID", queryID, "totalCount", *totalCount)
+		}
+		aggregation.maybeFlush(queryID)
+		ack()
 		return
 	}
 
 	aggregation.handleDataMessage(queryID, fruitRecords)
+	aggregation.maybeFlush(queryID)
+	ack()
 }
 
 func (aggregation *Aggregation) handleEndOfRecordsMessage(queryID string) error {
@@ -142,6 +158,8 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(queryID string) error 
 	}
 
 	delete(aggregation.fruitItemMap, queryID)
+	delete(aggregation.totalCount, queryID)
+	delete(aggregation.partialCounts, queryID)
 	return nil
 }
 
@@ -173,4 +191,41 @@ func (aggregation *Aggregation) buildFruitTop(fruitMap map[string]fruititem.Frui
 
 	finalTopSize := min(aggregation.topSize, len(fruitItems))
 	return fruitItems[:finalTopSize]
+}
+
+func (aggregation *Aggregation) maybeFlush(queryID string) {
+	total := aggregation.totalCount[queryID]
+	if total == nil {
+		return
+	}
+
+	partials, ok := aggregation.partialCounts[queryID]
+	if !ok {
+		return
+	}
+
+	// valido que tengo el partial_count de todos los sums
+	if len(partials) < aggregation.sumAmount {
+		return
+	}
+
+	// valido que suma de parciales == total
+	sum := 0
+	for _, p := range partials {
+		sum += p
+	}
+
+	if sum != *total {
+		slog.Info("Partial counts do not match total yet, waiting for more data",
+			"queryID", queryID,
+			"partialSum", sum,
+			"total", *total,
+		)
+		return
+	}
+
+	slog.Info("All data received, flushing", "queryID", queryID, "total", *total)
+	if err := aggregation.handleEndOfRecordsMessage(queryID); err != nil {
+		slog.Error("While handling end of record message", "err", err)
+	}
 }
