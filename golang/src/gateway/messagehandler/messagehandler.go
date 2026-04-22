@@ -36,13 +36,12 @@ func (messageHandler *MessageHandler) SerializeEOFMessage() (*middleware.Message
 	return inner.SerializeMessageWithIDAndPropagationAndTotal(
 		messageHandler.id,
 		data,
-		false,
 		&total,
 	)
 }
 
 func (messageHandler *MessageHandler) DeserializeResultMessage(message *middleware.Message) ([]fruititem.FruitItem, error) {
-	queryID, fruitRecords, _, _, _, err := inner.DeserializeMessageWithID(message)
+	queryID, fruitRecords, _, _, err := inner.DeserializeMessageWithID(message)
 	if err != nil {
 		return nil, err
 	}

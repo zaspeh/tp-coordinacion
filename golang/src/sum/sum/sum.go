@@ -33,7 +33,6 @@ type Sum struct {
 	flushedQueries    map[string]bool
 	sumAmount         int
 	aggregationAmount int
-	aggregationPrefix string
 }
 
 type msgWithAck struct {
@@ -102,7 +101,6 @@ func NewSum(config SumConfig) (*Sum, error) {
 		flushedQueries:    map[string]bool{},
 		sumAmount:         config.SumAmount,
 		aggregationAmount: config.AggregationAmount,
-		aggregationPrefix: config.AggregationPrefix,
 	}, nil
 }
 
@@ -150,7 +148,7 @@ func (sum *Sum) Run() {
 }
 
 func (sum *Sum) handleData(msg middleware.Message, ack func(), nack func()) {
-	queryID, fruitRecords, isEof, propagated, totalCount, err := inner.DeserializeMessageWithID(&msg)
+	queryID, fruitRecords, isEof, totalCount, err := inner.DeserializeMessageWithID(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		nack()
@@ -158,7 +156,7 @@ func (sum *Sum) handleData(msg middleware.Message, ack func(), nack func()) {
 	}
 
 	if isEof {
-		if sum.sumAmount > 1 && !propagated {
+		if sum.sumAmount > 1 {
 			if err := sum.propagateEndOfRecordMessage(queryID); err != nil {
 				slog.Error("While propagating EOF", "err", err)
 				nack()
@@ -184,7 +182,7 @@ func (sum *Sum) handleData(msg middleware.Message, ack func(), nack func()) {
 }
 
 func (sum *Sum) handleControl(msg middleware.Message, ack func(), nack func()) {
-	queryID, _, isEof, _, _, err := inner.DeserializeMessageWithID(&msg)
+	queryID, _, isEof, _, err := inner.DeserializeMessageWithID(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		nack()
@@ -226,7 +224,7 @@ func (sum *Sum) handleEndOfRecordMessage(queryID string, totalCount *int) error 
 	}
 
 	for i := 0; i < sum.aggregationAmount; i++ {
-		message, err := inner.SerializeMessageWithIDAndPropagationAndTotal(queryID, []fruititem.FruitItem{}, false, totalCount)
+		message, err := inner.SerializeMessageWithIDAndPropagationAndTotal(queryID, []fruititem.FruitItem{}, totalCount)
 		if err != nil {
 			slog.Error("While serializing EOF", "err", err)
 			return err
@@ -280,7 +278,7 @@ func (sum *Sum) sendDelta(queryID string, fruitRecords []fruititem.FruitItem) er
 }
 
 func (sum *Sum) propagateEndOfRecordMessage(queryID string) error {
-	eofMsg, err := inner.SerializeMessageWithIDAndPropagation(queryID, []fruititem.FruitItem{}, true)
+	eofMsg, err := inner.SerializeMessageWithIDAndPropagation(queryID, []fruititem.FruitItem{})
 	if err != nil {
 		slog.Error("While serializing propagated EOF", "err", err)
 		return err

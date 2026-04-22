@@ -81,7 +81,7 @@ func (join *Join) Run() {
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
-	queryID, fruitRecords, isEof, _, _, err := inner.DeserializeMessageWithID(&msg)
+	queryID, fruitRecords, isEof, _, err := inner.DeserializeMessageWithID(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		return
@@ -135,11 +135,9 @@ func (join *Join) sendFinalTop(queryID string) {
 		return fruitItems[j].Less(fruitItems[i])
 	})
 
-	if len(fruitItems) > join.topSize {
-		fruitItems = fruitItems[:join.topSize]
-	}
+	finalTopSize := min(join.topSize, len(fruitItems))
 
-	msg, err := inner.SerializeMessageWithID(queryID, fruitItems)
+	msg, err := inner.SerializeMessageWithID(queryID, fruitItems[:finalTopSize])
 	if err != nil {
 		slog.Error("While serializing final top", "err", err)
 		return

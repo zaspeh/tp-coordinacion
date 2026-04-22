@@ -79,7 +79,7 @@ func (aggregation *Aggregation) Run() {
 }
 
 func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {
-	queryID, fruitRecords, isEof, _, totalCount, partialCount, sumID, err := inner.DeserializeFullMessage(&msg)
+	queryID, fruitRecords, isEof, totalCount, partialCount, sumID, err := inner.DeserializeFullMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		nack()
