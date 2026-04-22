@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
@@ -32,10 +31,15 @@ type Sum struct {
 	fruitItemMap      map[string]map[string]fruititem.FruitItem
 	processedCount    map[string]int
 	flushedQueries    map[string]bool
-	fruitMapLock      sync.Mutex
 	sumAmount         int
 	aggregationAmount int
 	aggregationPrefix string
+}
+
+type msgWithAck struct {
+	msg  middleware.Message
+	ack  func()
+	nack func()
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -96,7 +100,6 @@ func NewSum(config SumConfig) (*Sum, error) {
 		fruitItemMap:      map[string]map[string]fruititem.FruitItem{},
 		processedCount:    map[string]int{},
 		flushedQueries:    map[string]bool{},
-		fruitMapLock:      sync.Mutex{},
 		sumAmount:         config.SumAmount,
 		aggregationAmount: config.AggregationAmount,
 		aggregationPrefix: config.AggregationPrefix,
@@ -107,31 +110,41 @@ func (sum *Sum) Run() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM)
 
-	go func() {
-		if err := sum.controlExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-			sum.handleControl(msg, ack, nack)
-		}); err != nil {
-			slog.Error("control consumer failed", "err", err)
-		}
-	}()
+	dataCh := make(chan msgWithAck)
+	controlCh := make(chan msgWithAck)
 
 	go func() {
 		if err := sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-			sum.handleData(msg, ack, nack)
+			dataCh <- msgWithAck{msg, ack, nack}
 		}); err != nil {
 			slog.Error("input consumer failed", "err", err)
 		}
 	}()
 
-	// me quedo esperando hasta sigterm
-	sig := <-sigChan
-	slog.Info("Received signal, shutting down", "signal", sig)
+	go func() {
+		if err := sum.controlExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			controlCh <- msgWithAck{msg, ack, nack}
+		}); err != nil {
+			slog.Error("control consumer failed", "err", err)
+		}
+	}()
 
-	sum.inputQueue.Close()
-	sum.controlExchange.Close()
-	for i, ex := range sum.outputExchanges {
-		if err := ex.Close(); err != nil {
-			slog.Error("error closing aggregation exchange", "index", i, "err", err)
+	for {
+		select {
+		case m := <-dataCh:
+			sum.handleData(m.msg, m.ack, m.nack)
+		case m := <-controlCh:
+			sum.handleControl(m.msg, m.ack, m.nack)
+		case sig := <-sigChan:
+			slog.Info("Received signal, shutting down", "signal", sig)
+			sum.inputQueue.Close()
+			sum.controlExchange.Close()
+			for i, ex := range sum.outputExchanges {
+				if err := ex.Close(); err != nil {
+					slog.Error("error closing aggregation exchange", "index", i, "err", err)
+				}
+			}
+			return
 		}
 	}
 }
@@ -192,55 +205,24 @@ func (sum *Sum) handleControl(msg middleware.Message, ack func(), nack func()) {
 func (sum *Sum) handleEndOfRecordMessage(queryID string, totalCount *int) error {
 	slog.Info("Received End Of Records message")
 
-	sum.fruitMapLock.Lock()
-
 	// me interesan las frutas de esta query
-	fruitMap, ok := sum.fruitItemMap[queryID]
-	if !ok {
-		sum.fruitMapLock.Unlock()
-		return nil
-	}
-
-	// copio los datos
-	localCopy := make([]fruititem.FruitItem, 0, len(fruitMap))
-	for _, v := range fruitMap {
-		localCopy = append(localCopy, v)
-	}
-
+	fruitMap := sum.fruitItemMap[queryID]
 	processed := sum.processedCount[queryID]
 
 	delete(sum.fruitItemMap, queryID)
 	delete(sum.processedCount, queryID)
 	sum.flushedQueries[queryID] = true
 
-	sum.fruitMapLock.Unlock()
-
-	for _, fruitRecord := range localCopy {
+	for _, fruitRecord := range fruitMap {
 		aggID := getAggregationID(fruitRecord.Fruit, sum.aggregationAmount)
 
-		message, err := inner.SerializeMessageWithID(queryID, []fruititem.FruitItem{fruitRecord})
-		if err != nil {
-			slog.Debug("While serializing message", "err", err)
-			return err
-		}
-
-		if err := sum.outputExchanges[aggID].Send(*message); err != nil {
-			slog.Debug("While sending message", "err", err)
+		if err := sum.serializeAndSendToAgg(queryID, aggID, fruitRecord); err != nil {
 			return err
 		}
 	}
 
-	for i := 0; i < sum.aggregationAmount; i++ {
-		slog.Info("Sending partial count", "queryID", queryID, "processed", processed, "sumID", sum.id)
-		message, err := inner.SerializePartialMessage(queryID, processed, sum.id)
-		if err != nil {
-			slog.Error("While serializing Partial Message", "err", err)
-			return err
-		}
-		if err := sum.outputExchanges[i].Send(*message); err != nil {
-			slog.Error("While sending Partial Message", "err", err)
-			return err
-		}
+	if err := sum.serializeAndSendPartialToAllAggs(queryID, processed); err != nil {
+		return err
 	}
 
 	for i := 0; i < sum.aggregationAmount; i++ {
@@ -259,20 +241,11 @@ func (sum *Sum) handleEndOfRecordMessage(queryID string, totalCount *int) error 
 }
 
 func (sum *Sum) handleDataMessage(queryID string, fruitRecords []fruititem.FruitItem) error {
-	sum.fruitMapLock.Lock()
-	flushed := sum.flushedQueries[queryID]
-	sum.fruitMapLock.Unlock()
 
 	// si la query ya fue flusheada, los datos que llegan son late data -> envio delta directo
-	if flushed {
-		sum.fruitMapLock.Lock()
-		sum.processedCount[queryID]++
-		sum.fruitMapLock.Unlock()
+	if sum.flushedQueries[queryID] {
 		return sum.sendDelta(queryID, fruitRecords)
 	}
-
-	sum.fruitMapLock.Lock()
-	defer sum.fruitMapLock.Unlock()
 
 	if _, ok := sum.fruitItemMap[queryID]; !ok {
 		sum.fruitItemMap[queryID] = map[string]fruititem.FruitItem{}
@@ -288,38 +261,19 @@ func (sum *Sum) handleDataMessage(queryID string, fruitRecords []fruititem.Fruit
 	}
 
 	sum.processedCount[queryID]++
-
 	return nil
 }
 
 func (sum *Sum) sendDelta(queryID string, fruitRecords []fruititem.FruitItem) error {
 	for _, fruitRecord := range fruitRecords {
 		aggID := getAggregationID(fruitRecord.Fruit, sum.aggregationAmount)
-		message, err := inner.SerializeMessageWithID(queryID, []fruititem.FruitItem{fruitRecord})
-		if err != nil {
-			slog.Debug("While serializing message", "err", err)
-			return err
-		}
-		if err := sum.outputExchanges[aggID].Send(*message); err != nil {
-			slog.Debug("While sending message", "err", err)
+		if err := sum.serializeAndSendToAgg(queryID, aggID, fruitRecord); err != nil {
 			return err
 		}
 	}
 
-	sum.fruitMapLock.Lock()
-	processed := sum.processedCount[queryID]
-	sum.fruitMapLock.Unlock()
-
-	for i := 0; i < sum.aggregationAmount; i++ {
-		message, err := inner.SerializePartialMessage(queryID, processed, sum.id)
-		if err != nil {
-			slog.Error("While serializing Partial Message", "err", err)
-			return err
-		}
-		if err := sum.outputExchanges[i].Send(*message); err != nil {
-			slog.Error("While sending Partial Message", "err", err)
-			return err
-		}
+	if err := sum.serializeAndSendPartialToAllAggs(queryID, 1); err != nil { // envío 1 solo count, así agg. suma el mensaje late data
+		return err
 	}
 
 	return nil
@@ -337,6 +291,35 @@ func (sum *Sum) propagateEndOfRecordMessage(queryID string) error {
 		return err
 	}
 
+	return nil
+}
+
+func (sum *Sum) serializeAndSendToAgg(queryID string, aggID int, fruitRecord fruititem.FruitItem) error {
+	message, err := inner.SerializeSingleFruit(queryID, fruitRecord)
+	if err != nil {
+		slog.Error("While serializing message", "err", err)
+		return err
+	}
+	if err := sum.outputExchanges[aggID].Send(*message); err != nil {
+		slog.Debug("While sending message", "err", err)
+		return err
+	}
+	return nil
+}
+
+func (sum *Sum) serializeAndSendPartialToAllAggs(queryID string, partial int) error {
+	for i := 0; i < sum.aggregationAmount; i++ {
+		slog.Info("Sending partial count", "queryID", queryID, "processed", partial, "sumID", sum.id)
+		message, err := inner.SerializePartialMessage(queryID, partial, sum.id)
+		if err != nil {
+			slog.Error("While serializing Partial Message", "err", err)
+			return err
+		}
+		if err := sum.outputExchanges[i].Send(*message); err != nil {
+			slog.Error("While sending Partial Message", "err", err)
+			return err
+		}
+	}
 	return nil
 }
 

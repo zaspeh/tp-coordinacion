@@ -26,6 +26,10 @@ func SerializeMessageWithIDAndPropagation(queryID string, fruitRecords []fruitit
 	return SerializeMessageWithIDAndPropagationAndTotal(queryID, fruitRecords, propagated, nil)
 }
 
+func SerializeSingleFruit(queryID string, fruit fruititem.FruitItem) (*middleware.Message, error) {
+	return SerializeMessageWithID(queryID, []fruititem.FruitItem{fruit})
+}
+
 func SerializeMessageWithIDAndPropagationAndTotal(
 	queryID string,
 	fruitRecords []fruititem.FruitItem,

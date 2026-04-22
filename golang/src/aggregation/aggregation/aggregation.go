@@ -30,9 +30,8 @@ type Aggregation struct {
 	inputExchange middleware.Middleware
 	fruitItemMap  map[string]map[string]fruititem.FruitItem
 	topSize       int
-	sumAmount     int
 	totalCount    map[string]*int
-	partialCounts map[string]map[int]int
+	partialCounts map[string]int
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -55,9 +54,8 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		inputExchange: inputExchange,
 		fruitItemMap:  map[string]map[string]fruititem.FruitItem{},
 		topSize:       config.TopSize,
-		sumAmount:     config.SumAmount,
 		totalCount:    map[string]*int{},
-		partialCounts: map[string]map[int]int{},
+		partialCounts: map[string]int{},
 	}, nil
 }
 
@@ -88,23 +86,29 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 		return
 	}
 
-	slog.Info("Received message",
-		"queryID", queryID,
-		"isEof", isEof,
-		"fruits", len(fruitRecords),
-		"totalCount", totalCount,
-		"partialCount", partialCount,
-		"sumID", sumID,
-	)
+	/*
+		slog.Info("Received message",
+			"queryID", queryID,
+			"isEof", isEof,
+			"fruits", len(fruitRecords),
+			"totalCount", totalCount,
+			"partialCount", partialCount,
+			"sumID", sumID,
+		)
+	*/
 
 	// partial_count
 	if partialCount != nil && sumID != nil {
-		if _, ok := aggregation.partialCounts[queryID]; !ok {
-			aggregation.partialCounts[queryID] = map[int]int{}
+		aggregation.partialCounts[queryID] += *partialCount
+
+		slog.Info("Received partial count", "queryID", queryID, "sumID", *sumID, "partialCount", *partialCount, "accumulated", aggregation.partialCounts[queryID])
+
+		if err := aggregation.maybeFlush(queryID); err != nil {
+			slog.Error("While flushing", "err", err)
+			nack()
+			return
 		}
-		aggregation.partialCounts[queryID][*sumID] = *partialCount
-		slog.Info("Received partial count", "queryID", queryID, "sumID", *sumID, "partialCount", *partialCount)
-		aggregation.maybeFlush(queryID)
+
 		ack()
 		return
 	}
@@ -115,45 +119,51 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 			aggregation.totalCount[queryID] = totalCount
 			slog.Info("Received EOF with total count", "queryID", queryID, "totalCount", *totalCount)
 		}
-		aggregation.maybeFlush(queryID)
+		if err := aggregation.maybeFlush(queryID); err != nil {
+			slog.Error("While flushing", "err", err)
+			nack()
+			return
+		}
 		ack()
 		return
 	}
 
 	aggregation.handleDataMessage(queryID, fruitRecords)
-	aggregation.maybeFlush(queryID)
+	if err := aggregation.maybeFlush(queryID); err != nil {
+		slog.Error("While flushing", "err", err)
+		nack()
+		return
+	}
 	ack()
 }
 
+func (aggregation *Aggregation) serializeAndSendOutput(queryID string, fruitRecords []fruititem.FruitItem) error {
+	message, err := inner.SerializeMessageWithID(queryID, fruitRecords)
+	if err != nil {
+		slog.Error("While serializing message", "err", err)
+		return err
+	}
+	return aggregation.outputQueue.Send(*message)
+}
+
 func (aggregation *Aggregation) handleEndOfRecordsMessage(queryID string) error {
-	slog.Info("Received End Of Records message", "queryID", queryID)
+	slog.Info("Sending top partial", "queryID", queryID)
 
 	fruitMap, ok := aggregation.fruitItemMap[queryID]
 	if !ok {
-		slog.Debug("While getting fruitItemMap")
+		slog.Warn("fruitItemMap not found on flush", "queryID", queryID)
+		delete(aggregation.totalCount, queryID)
+		delete(aggregation.partialCounts, queryID)
 		return nil
 	}
 
-	fruitTopRecords := aggregation.buildFruitTop(fruitMap)
-
-	message, err := inner.SerializeMessageWithID(queryID, fruitTopRecords)
-	if err != nil {
-		slog.Debug("While serializing top message", "err", err)
-		return err
-	}
-	if err := aggregation.outputQueue.Send(*message); err != nil {
-		slog.Debug("While sending top message", "err", err)
+	if err := aggregation.serializeAndSendOutput(queryID, aggregation.buildFruitTop(fruitMap)); err != nil {
+		slog.Error("While sending top message", "err", err)
 		return err
 	}
 
-	eofMessage, err := inner.SerializeMessageWithID(queryID, []fruititem.FruitItem{})
-	if err != nil {
-		slog.Debug("While serializing EOF message", "err", err)
-		return err
-	}
-
-	if err := aggregation.outputQueue.Send(*eofMessage); err != nil {
-		slog.Debug("While sending EOF message", "err", err)
+	if err := aggregation.serializeAndSendOutput(queryID, []fruititem.FruitItem{}); err != nil {
+		slog.Error("While sending EOF message", "err", err)
 		return err
 	}
 
@@ -193,39 +203,28 @@ func (aggregation *Aggregation) buildFruitTop(fruitMap map[string]fruititem.Frui
 	return fruitItems[:finalTopSize]
 }
 
-func (aggregation *Aggregation) maybeFlush(queryID string) {
+func (aggregation *Aggregation) maybeFlush(queryID string) error {
 	total := aggregation.totalCount[queryID]
 	if total == nil {
-		return
+		return nil
 	}
 
-	partials, ok := aggregation.partialCounts[queryID]
-	if !ok {
-		return
-	}
+	accumulated := aggregation.partialCounts[queryID]
 
-	// valido que tengo el partial_count de todos los sums
-	if len(partials) < aggregation.sumAmount {
-		return
-	}
-
-	// valido que suma de parciales == total
-	sum := 0
-	for _, p := range partials {
-		sum += p
-	}
-
-	if sum != *total {
+	if accumulated < *total {
 		slog.Info("Partial counts do not match total yet, waiting for more data",
 			"queryID", queryID,
-			"partialSum", sum,
+			"accumulated", accumulated,
 			"total", *total,
 		)
-		return
+		return nil
 	}
 
 	slog.Info("All data received, flushing", "queryID", queryID, "total", *total)
 	if err := aggregation.handleEndOfRecordsMessage(queryID); err != nil {
 		slog.Error("While handling end of record message", "err", err)
+		return err
 	}
+
+	return nil
 }
