@@ -79,11 +79,10 @@ func (join *Join) Run() {
 }
 
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
-	defer ack()
-
 	queryID, fruitRecords, isEof, _, err := inner.DeserializeMessageWithID(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
+		nack()
 		return
 	}
 
@@ -93,14 +92,19 @@ func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func())
 		join.eofCount[queryID]++
 
 		if join.eofCount[queryID] == join.aggregationAmount {
-			join.sendFinalTop(queryID)
+			if err := join.sendFinalTop(queryID); err != nil {
+				nack()
+				return
+			}
 			delete(join.eofCount, queryID)
 		}
+		ack()
 		return
 	}
 
 	// si no es eof entonces sumo datos
 	join.handleData(queryID, fruitRecords)
+	ack()
 }
 
 func (join *Join) handleData(queryID string, fruitRecords []fruititem.FruitItem) {
@@ -118,12 +122,12 @@ func (join *Join) handleData(queryID string, fruitRecords []fruititem.FruitItem)
 	}
 }
 
-func (join *Join) sendFinalTop(queryID string) {
+func (join *Join) sendFinalTop(queryID string) error {
 	slog.Info("Join building final top", "queryID", queryID)
 
 	fruitMap, ok := join.fruitMap[queryID]
 	if !ok {
-		return
+		return nil
 	}
 
 	fruitItems := make([]fruititem.FruitItem, 0, len(fruitMap))
@@ -140,13 +144,14 @@ func (join *Join) sendFinalTop(queryID string) {
 	msg, err := inner.SerializeMessageWithID(queryID, fruitItems[:finalTopSize])
 	if err != nil {
 		slog.Error("While serializing final top", "err", err)
-		return
+		return err
 	}
 
 	if err := join.outputQueue.Send(*msg); err != nil {
 		slog.Error("While sending final top", "err", err)
-		return
+		return err
 	}
 
 	delete(join.fruitMap, queryID)
+	return nil
 }
