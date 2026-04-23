@@ -98,8 +98,8 @@ cuando una instancia de Sum recibe el EOF del cliente a través del flujo de dat
 Al momento de hacer flush, cada Sum envía sus frutas al Aggregator que corresponde según un hash del nombre de la fruta (esto permite dividir el trabajo para las distintas instancias de Aggregators) y reporta la cantidad de mensajes que procesó (partial_count) a todos los Aggregators.
 Para garantizar consistencia, cada instancia de Sum envía primero los datos y luego el correspondiente partial_count. Esto asegura que el Aggregator no considere completa una query antes de haber recibido todos los datos asociados.
 
-El Aggregator que recibe los datos de una query espera hasta que la suma acumulada de todos los partial_count recibidos iguale el total_count informado por el gateway en el EOF. Este mecanismo garantiza que el Aggregator solo calcula el top parcial cuando tiene la certeza de haber recibido todos los datos de esa query. Una vez verificado, envía el top parcial al Joiner.
-El Joiner consolida los tops parciales de todas las instancias de Aggregator. Cuando recibe un EOF de cada una de ellas, calcula el top final (utilizando la función Less(...) de FruitItem) y lo envía al gateway para ser entregado al cliente.
+El Aggregator que recibe los datos de una query espera hasta que la suma acumulada de todos los partial_count recibidos iguale el total_count informado por el gateway en el EOF. Este mecanismo garantiza que el Aggregator solo calcula el top parcial (utilizando la función Less(...) de FruitItem) cuando tiene la certeza de haber recibido todos los datos de esa query. Una vez verificado, envía el top parcial al Joiner.
+El Joiner consolida los tops parciales de todas las instancias de Aggregator. Cuando recibe un EOF de cada una de ellas, calcula el top final y lo envía al gateway para ser entregado al cliente.
 
 ### Manejo de late data
 
@@ -117,5 +117,5 @@ Este enfoque evita la acumulación indefinida de estado en memoria, por ende, el
 El sistema escala horizontalmente en todas sus dimensiones:
 * La cantidad de clientes concurrentes está desacoplada mediante el uso de queryID, permitiendo procesar múltiples flujos de datos en paralelo sin interferencias.
 * Las instancias de Sum escalan consumiendo de una cola compartida, lo que permite distribuir automáticamente la carga de trabajo entre ellas. A medida que se agregan más instancias, disminuye la cantidad de mensajes procesados por cada una sin necesidad de modificar la lógica del sistema.
-* Las instancias de Aggregator escalan mediante particionamiento por hash del nombre de la fruta, garantizando que cada clave sea procesada por una única instancia, esto permite distribuir el cómputo sin redundancia. A su vez no necesitan conocer la cantidad de instancias de Sum, ya que simplemente acumulan los partial_count recibidos y los comparan contra el total_count.
+* Las instancias de Aggregator escalan mediante particionamiento por hash del nombre de la fruta (por ejemplo un Aggregator podría procesar Bananas y otro Peras), esto permite distribuir el cómputo sin redundancia. A su vez no necesitan conocer la cantidad de instancias de Sum, ya que simplemente acumulan los partial_count recibidos y los comparan contra el total_count.
 * El Joiner recibe un EOF por cada instancia de Aggregator, por lo que también se adapta automáticamente a cambios en esa cantidad.
